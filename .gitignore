@@ -1,0 +1,32 @@
+# Virtual environment
+evenv/
+
+# Dataset mentah (ratusan MB-GB per file, tidak untuk version control)
+Dataset/
+
+# Fitur & artefak hasil generate (regenerable lewat src/data_pipeline/build_features.py)
+data/processed/
+
+# Model terlatih (131MB/file, melebihi batas 100MB GitHub — regenerable lewat src/model/train.py)
+models/*.pkl
+
+# Unit test
+tests/
+
+# Claude Code / AI assistant local files
+.claude/
+CLAUDE.md
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+*.egg-info/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+*.code-workspace
