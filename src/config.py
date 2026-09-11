@@ -24,6 +24,14 @@ BANDPASS_ORDER = 4
 BANDPASS_RS_DB = 40       # stopband attenuation (dB) untuk Chebyshev Type II
 
 # ---------------------------------------------------------------------------
+# Filter notch (powerline interference)
+# ---------------------------------------------------------------------------
+# 50 Hz dipakai sebagai default (standar jaringan listrik Indonesia/Eropa).
+# Ganti ke 60.0 kalau akuisisi dilakukan di jaringan 60Hz (mis. Amerika).
+NOTCH_FREQ_HZ = 50.0
+NOTCH_QUALITY_FACTOR = 30.0   # Q tinggi -> notch sempit, minim distorsi di luar 50Hz
+
+# ---------------------------------------------------------------------------
 # Path proyek
 # ---------------------------------------------------------------------------
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -41,6 +49,7 @@ MODELS_DIR = os.path.join(PROJECT_ROOT, "models")
 REPORTS_DIR = os.path.join(PROJECT_ROOT, "reports")
 
 DEFAULT_DATASET_FILE = os.path.join(RAW_DATA_DIR, "part_1.mat")
+DATASET_GLOB_PATTERN = os.path.join(RAW_DATA_DIR, "part_*.mat")  # part_1.mat .. part_12.mat
 
 SBP_MODEL_PATH = os.path.join(MODELS_DIR, "ebt_sbp.pkl")
 DBP_MODEL_PATH = os.path.join(MODELS_DIR, "ebt_dbp.pkl")
