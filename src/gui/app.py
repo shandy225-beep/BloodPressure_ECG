@@ -28,7 +28,7 @@ from src.config import (
     FS_TARGET, EPOCH_LEN, GUI_PLOT_WINDOW_SEC, GUI_UPDATE_INTERVAL_MS,
     SBP_MODEL_PATH, DBP_MODEL_PATH, FEATURE_NAMES,
 )
-from src.preprocessing.filters import apply_bandpass_cheby2
+from src.preprocessing.filters import apply_full_preprocessing
 from src.features.time_domain import extract_features
 from src.data_pipeline.epoching import EpochBuffer
 from src.acquisition.shimmer_interface import ShimmerECGStream
@@ -326,7 +326,7 @@ class BPMonitorGUI(QMainWindow):
             self._process_epoch(completed_epoch)
 
     def _process_epoch(self, epoch: np.ndarray):
-        filtered = apply_bandpass_cheby2(epoch, fs=FS_TARGET)
+        filtered = apply_full_preprocessing(epoch, fs=FS_TARGET)
         sbp, dbp = self.predictor.predict(filtered)
         if sbp is None:
             return
