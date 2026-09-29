@@ -61,8 +61,9 @@ logger = logging.getLogger(__name__)
 
 
 def _hjorth_mobility(x: np.ndarray) -> float:
-    """sqrt(var(x)/var(reference)) — std di sini SELALU populasi (ddof=0),
-    konsisten dengan definisi S pada Table 2 baris #20."""
+    """Hjorth Mobility = std(x') / std(x) = sqrt(var(x')/var(x)), x' = diff(x).
+    std di sini SELALU populasi (ddof=0), konsisten dengan definisi S pada
+    Table 2 baris #20. Complexity memanggil fungsi ini pada x dan pada x'."""
     std_x = np.std(x)
     if std_x == 0:
         return 0.0
@@ -146,7 +147,7 @@ def extract_features(epoch: np.ndarray) -> dict:
     average_energy = float(np.mean(x ** 2))
     rms = float(np.sqrt(average_energy))
     # 19 — Standard Error: S_xbar = S/sqrt(n), S = std populasi
-    standard_error = float(std_x / np.sqrt(N)) if N > 0 else 0.0
+    standard_error = float(std_x / np.sqrt(N))
 
     mean_abs_x = float(np.mean(np.abs(x)))
     if mean_abs_x == 0:
@@ -163,8 +164,8 @@ def extract_features(epoch: np.ndarray) -> dict:
     # 0.125/sisi; trimmean(x,50) -> proportiontocut 0.25/sisi.
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        raw_trim25 = stats.trim_mean(x, 0.125) if N > 0 else np.nan
-        raw_trim50 = stats.trim_mean(x, 0.25) if N > 0 else np.nan
+        raw_trim25 = stats.trim_mean(x, 0.125)
+        raw_trim50 = stats.trim_mean(x, 0.25)
     trimmed_mean_25 = float(raw_trim25) if np.isfinite(raw_trim25) else median_x
     trimmed_mean_50 = float(raw_trim50) if np.isfinite(raw_trim50) else median_x
 

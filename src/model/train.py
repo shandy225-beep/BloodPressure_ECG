@@ -28,6 +28,7 @@ import argparse
 import itertools
 import logging
 import sys
+from datetime import datetime
 
 import joblib
 import numpy as np
@@ -44,6 +45,7 @@ from src.config import (
     SBP_MODEL_PATH,
     DBP_MODEL_PATH,
 )
+from src.model.evaluate import compute_metrics, log_experiment, print_and_save_report
 
 # stdout (print) dan stderr (logger) dibuat line-buffered supaya keduanya
 # tampil ke terminal dalam urutan kronologis yang benar, bukan tertahan di
@@ -52,30 +54,32 @@ sys.stdout.reconfigure(line_buffering=True)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
-# Grid percobaan v2 (diperluas dari baseline [30,60] x [6,10,None]).
-# Rasional tiap parameter baru/diperlebar:
-#   - n_estimators tambah 100: pada baseline, GridSearchCV SELALU memilih
-#     nilai tertinggi di grid (60) untuk SBP maupun DBP -> indikasi kuat
-#     performa masih bisa naik dengan menambah jumlah tree, belum plateau.
-#   - max_depth tambah 15, 20: baseline juga SELALU memilih None (tanpa
-#     batas) -> perlu dicek apakah titik optimal sebenarnya ada di
-#     kedalaman terbatas (menahan overfit ke data 12-part yang jauh lebih
-#     beragam), bukan ekstrem tanpa batas.
-#   - min_samples_leaf (BARU): baseline tidak meregulasi ukuran daun sama
-#     sekali (default sklearn = 1, daun boleh sekecil 1 sampel) -> kandidat
-#     penyebab utama MAPE/R2 turun saat pindah dari part_1 saja ke gabungan
-#     12 part (populasi lebih beragam = pohon lebih mudah overfit ke noise
-#     kalau daunnya dibiarkan sekecil ini).
+# Grid parameter untuk GridSearchCV. GridSearchCV mencoba SETIAP kombinasi
+# nilai di bawah ini x n_splits fold, jadi ukuran grid menentukan waktu
+# training secara langsung (lihat _print_param_grid saat dijalankan untuk
+# jumlah fit & progresnya; parameter yang benar-benar terpilih tersimpan di
+# models/ebt_{sbp,dbp}.pkl dan bisa dibaca lewat model["model"].get_params(),
+# BUKAN di komentar ini -- jangan catat hasil eksperimen di sini, catat di
+# reports/ atau pesan commit, supaya komentar ini tidak basi tiap kali grid
+# diubah).
 #
-# PERINGATAN WAKTU: grid ini 3 x 3 x 3 = 27 kombinasi x 10 fold = 270 fit
-# per target (SBP+DBP = 540 fit total, GridSearchCV saja) -> kira-kira 4-5x
-# lebih lama dari baseline (yang 60 fit/target, sekitar 45-50 menit/target).
-# Perkiraan total: bisa beberapa jam. Kalau ingin percobaan lebih cepat,
-# kurangi salah satu daftar di bawah ini (mis. n_estimators cukup [60,100]).
+# Arti tiap parameter (BaggingRegressor + DecisionTreeRegressor):
+#   - n_estimators: jumlah pohon yang dirata-rata. Bagging tidak overfit
+#     dengan menambah pohon -- ini murni tukar waktu training dengan
+#     stabilitas prediksi, manfaatnya mengecil cepat setelah puluhan pohon.
+#   - estimator__min_samples_leaf: ukuran minimum daun tiap pohon. Kecil
+#     (mis. 1) -> pohon bisa menghafal sampel individual (overfit); besar
+#     -> prediksi lebih halus tapi bisa terlalu kasar (underfit). Ini
+#     parameter yang paling menentukan trade-off overfit/underfit.
+#   - max_samples: fraksi data (dengan pengembalian) yang dilihat tiap
+#     pohon. Lebih kecil -> pohon lebih beragam & lebih cepat dilatih.
+#   - estimator__max_depth: kedalaman maksimum pohon (tidak dipakai di grid
+#     saat ini). Efeknya tumpang tindih dengan min_samples_leaf; tambahkan
+#     lagi hanya kalau min_samples_leaf saja belum cukup meregulasi pohon.
 PARAM_GRID = {
-    "n_estimators": [30, 60, 100],
-    "estimator__max_depth": [15, 20, None],
-    "estimator__min_samples_leaf": [1, 5, 10],
+    "n_estimators": [60],
+    "estimator__min_samples_leaf": [8, 30, 100],
+    "max_samples": [1.0],
 }
 RANDOM_STATE = 42
 
@@ -171,7 +175,7 @@ def train_single_target(X: np.ndarray, y: np.ndarray, groups: np.ndarray, target
     logger.info("Menghitung prediksi out-of-fold (cross_val_predict, %d fold, subject-wise)...", n_splits)
     y_pred_cv = cross_val_predict(search.best_estimator_, X, y, groups=groups, cv=group_kfold, n_jobs=-1, verbose=3)
 
-    return search.best_estimator_, y_pred_cv
+    return search.best_estimator_, y_pred_cv, search.best_params_, -search.best_score_
 
 
 def train_and_save(features_csv: str, n_splits: int = 10):
@@ -195,11 +199,37 @@ def train_and_save(features_csv: str, n_splits: int = 10):
 
     _print_cv_scheme(n_samples=len(df), groups=groups, n_splits=n_splits, random_state=RANDOM_STATE)
 
+    # Timestamp BERSAMA untuk baris SBP & DBP di experiment_log.csv, supaya
+    # keduanya mudah dikenali berasal dari run yang sama saat log dibaca ulang.
+    run_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    run_info_common = {
+        "timestamp": run_timestamp,
+        "n_samples": len(df),
+        "n_groups": len(np.unique(groups)),
+        "n_splits": n_splits,
+        "param_grid": str(PARAM_GRID),
+        "features_csv": features_csv,
+    }
+
     logger.info("Melatih model SBP (GroupKFold subject-wise + GridSearchCV)...")
-    model_sbp, y_sbp_pred_cv = train_single_target(X, y_sbp, groups, target_name="SBP", n_splits=n_splits, random_state=RANDOM_STATE)
+    model_sbp, y_sbp_pred_cv, best_params_sbp, cv_mae_sbp = train_single_target(
+        X, y_sbp, groups, target_name="SBP", n_splits=n_splits, random_state=RANDOM_STATE
+    )
+    # Dicatat SEGERA setelah SBP selesai (bukan menunggu DBP) -- kalau training
+    # DBP gagal/di-Ctrl+C setelahnya, hasil eksperimen SBP tidak ikut hilang.
+    log_experiment(
+        "SBP", compute_metrics(y_sbp, y_sbp_pred_cv),
+        {**run_info_common, "best_params": str(best_params_sbp), "cv_mae": cv_mae_sbp},
+    )
 
     logger.info("Melatih model DBP (GroupKFold subject-wise + GridSearchCV)...")
-    model_dbp, y_dbp_pred_cv = train_single_target(X, y_dbp, groups, target_name="DBP", n_splits=n_splits, random_state=RANDOM_STATE)
+    model_dbp, y_dbp_pred_cv, best_params_dbp, cv_mae_dbp = train_single_target(
+        X, y_dbp, groups, target_name="DBP", n_splits=n_splits, random_state=RANDOM_STATE
+    )
+    log_experiment(
+        "DBP", compute_metrics(y_dbp, y_dbp_pred_cv),
+        {**run_info_common, "best_params": str(best_params_dbp), "cv_mae": cv_mae_dbp},
+    )
 
     metadata_sbp = {
         "model": model_sbp,
@@ -233,8 +263,6 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     results = train_and_save(args.features_csv, n_splits=args.n_splits)
-
-    from src.model.evaluate import print_and_save_report
 
     print_and_save_report(results["y_sbp"], results["y_sbp_pred"], "SBP")
     print_and_save_report(results["y_dbp"], results["y_dbp_pred"], "DBP")

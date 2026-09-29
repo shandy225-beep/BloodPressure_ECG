@@ -11,20 +11,20 @@ Perbedaan terhadap kode lama: kelas lama (ShimmerReader) adalah QThread yang
 langsung emit ke GUI PyQt. Di sini logic koneksi dibungkus ke interface
 generik (connect/start_stream/read_sample/stop_stream/native_fs), dan
 native_fs DIBACA dari device lewat get_sampling_rate() (bukan diasumsikan)
-lalu setiap sampel di-resample ke FS_TARGET sebelum masuk queue (lihat
-resample_to_target()).
+lalu setiap sampel di-resample ke FS_TARGET sebelum masuk queue lewat
+StreamingResampler (stateful -- tidak ada artefak di batas potongan).
 """
 
 import logging
 import threading
-import time
 from queue import Empty, Queue
 from typing import Optional
 
+import numpy as np
 import serial
 
 from src.config import FS_TARGET
-from src.acquisition.resampler import resample_to_target
+from src.acquisition.resampler import StreamingResampler
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +45,8 @@ def adc_to_millivolts(adc_signal: float, gain: float = 6, offset: float = 0, vre
 
 class ShimmerECGStream:
     """Interface real-time Shimmer3R ECG. Sample keluaran sudah di-resample
-    ke FS_TARGET (lihat _emit_raw_sample) sebelum tersedia lewat read_sample().
+    ke FS_TARGET (lihat _handle_packet -> _flush_resampled_chunk) sebelum
+    tersedia lewat read_sample().
     """
 
     def __init__(self, port: str, baudrate: Optional[int] = None):
@@ -61,9 +62,14 @@ class ShimmerECGStream:
 
         self._queue: "Queue[float]" = Queue()
         self._raw_buffer = []          # buffer sampel native_fs sebelum resample
-        self._resample_chunk_sec = 1.0  # resample per potongan 1 detik (latensi kecil, ratio stabil)
+        # Ukuran potongan HANYA mengatur overhead Python vs latensi; hasil
+        # resample tidak bergantung padanya (StreamingResampler stateful).
+        self._resample_chunk_sec = 0.1
+        self._resampler: Optional[StreamingResampler] = None  # dibuat di connect() setelah native_fs diketahui
+        # _handle_packet berjalan di thread callback pyshimmer, sedangkan
+        # stop_stream() dipanggil dari thread lain -> state resampler dijaga lock.
+        self._lock = threading.Lock()
 
-        self._running = False
         self._connected = False
 
     def connect(self):
@@ -73,6 +79,7 @@ class ShimmerECGStream:
 
         dev_name = self._shim_dev.get_device_name()
         self.native_fs = float(self._shim_dev.get_sampling_rate())
+        self._resampler = StreamingResampler(self.native_fs, FS_TARGET)
         logger.info("Terhubung ke Shimmer '%s', native_fs=%.2f Hz", dev_name, self.native_fs)
 
         self._shim_dev.add_stream_callback(self._handle_packet)
@@ -84,18 +91,22 @@ class ShimmerECGStream:
             if EChannelType.EXG_ADS1292R_2_CH1_24BIT in pkt._values:
                 ecg_raw = pkt[EChannelType.EXG_ADS1292R_2_CH1_24BIT]
                 ecg_mv = adc_to_millivolts(ecg_raw, gain=6, offset=0)
-                self._raw_buffer.append(ecg_mv)
-
-                chunk_size = max(1, int(self._resample_chunk_sec * self.native_fs))
-                if len(self._raw_buffer) >= chunk_size:
-                    self._flush_resampled_chunk()
+                with self._lock:
+                    self._raw_buffer.append(ecg_mv)
+                    chunk_size = max(1, int(self._resample_chunk_sec * self.native_fs))
+                    if len(self._raw_buffer) >= chunk_size:
+                        self._flush_resampled_chunk()
         except Exception as e:
             logger.error("Error handling Shimmer packet: %s", e)
 
-    def _flush_resampled_chunk(self):
+    def _flush_resampled_chunk(self, final: bool = False):
+        """Resample isi _raw_buffer ke queue. Pemanggil WAJIB memegang self._lock.
+        final=True juga melepas ekor filter resampler (dipakai saat stream berhenti)."""
         chunk = self._raw_buffer
         self._raw_buffer = []
-        resampled = resample_to_target(chunk, native_fs=self.native_fs, target_fs=FS_TARGET)
+        resampled = self._resampler.process(chunk)
+        if final:
+            resampled = np.concatenate([resampled, self._resampler.flush()])
         for value in resampled:
             self._queue.put(float(value))
 
@@ -103,7 +114,6 @@ class ShimmerECGStream:
         if not self._connected:
             raise RuntimeError("Panggil connect() sebelum start_stream()")
         self._shim_dev.start_streaming()
-        self._running = True
 
     def read_sample(self, timeout: float = 0.5) -> Optional[float]:
         try:
@@ -112,9 +122,9 @@ class ShimmerECGStream:
             return None
 
     def stop_stream(self):
-        self._running = False
-        if self._raw_buffer:
-            self._flush_resampled_chunk()
+        with self._lock:
+            if self._resampler is not None:
+                self._flush_resampled_chunk(final=True)
 
         if self._shim_dev is not None:
             try:
