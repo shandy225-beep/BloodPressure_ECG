@@ -42,8 +42,11 @@ from src.config import (
     EPOCH_LEN,
     FEATURE_NAMES,
     PROCESSED_DATA_DIR,
+    FEATURE_REPORT_PATH,
     SBP_MODEL_PATH,
     DBP_MODEL_PATH,
+    sanitize_tag,
+    tagged_path,
 )
 from src.model.evaluate import compute_metrics, log_experiment, print_and_save_report
 
@@ -77,8 +80,8 @@ logger = logging.getLogger(__name__)
 #     saat ini). Efeknya tumpang tindih dengan min_samples_leaf; tambahkan
 #     lagi hanya kalau min_samples_leaf saja belum cukup meregulasi pohon.
 PARAM_GRID = {
-    "n_estimators": [60],
-    "estimator__min_samples_leaf": [8, 30, 100],
+    "n_estimators": [30],
+    "estimator__min_samples_leaf": [8],
     "max_samples": [1.0],
 }
 RANDOM_STATE = 42
@@ -178,7 +181,31 @@ def train_single_target(X: np.ndarray, y: np.ndarray, groups: np.ndarray, target
     return search.best_estimator_, y_pred_cv, search.best_params_, -search.best_score_
 
 
-def train_and_save(features_csv: str, n_splits: int = 10):
+def train_and_save(features_csv: str, n_splits: int = 10, model_tag: str = None):
+    """model_tag=None (default): TIMPA model produksi (SBP_MODEL_PATH/DBP_MODEL_PATH
+    di config.py, dipakai GUI) dan reports/eval_report.csv -- perilaku lama.
+    model_tag="nama": simpan ke models/ebt_{sbp,dbp}_nama.pkl dan
+    reports/eval_report_nama.csv, TIDAK menyentuh file produksi sama sekali --
+    aman dipakai berulang kali untuk membandingkan beberapa PARAM_GRID."""
+    model_tag = sanitize_tag(model_tag) if model_tag else None
+    sbp_path = tagged_path(SBP_MODEL_PATH, model_tag) if model_tag else SBP_MODEL_PATH
+    dbp_path = tagged_path(DBP_MODEL_PATH, model_tag) if model_tag else DBP_MODEL_PATH
+    report_path = tagged_path(FEATURE_REPORT_PATH, model_tag) if model_tag else FEATURE_REPORT_PATH
+
+    print("\n" + "=" * 60)
+    if model_tag:
+        print(f"MODE EKSPERIMEN (--tag={model_tag}): TIDAK menimpa file produksi.")
+        print(f"  Model  -> {sbp_path}")
+        print(f"           {dbp_path}")
+        print(f"  Laporan -> {report_path}")
+    else:
+        print("MODE PRODUKSI (tanpa --tag): MENIMPA model & laporan yang dipakai GUI.")
+        print(f"  Model  -> {sbp_path}")
+        print(f"           {dbp_path}")
+        print(f"  Laporan -> {report_path}")
+    print("  Semua run (produksi maupun eksperimen) tetap tercatat di reports/experiment_log.csv.")
+    print("=" * 60 + "\n")
+
     df = pd.read_csv(features_csv).dropna()
     logger.info("Dataset fitur: %d baris, %d kolom", *df.shape)
 
@@ -209,6 +236,9 @@ def train_and_save(features_csv: str, n_splits: int = 10):
         "n_splits": n_splits,
         "param_grid": str(PARAM_GRID),
         "features_csv": features_csv,
+        "model_tag": model_tag or "",
+        "sbp_model_path": sbp_path,
+        "dbp_model_path": dbp_path,
     }
 
     logger.info("Melatih model SBP (GroupKFold subject-wise + GridSearchCV)...")
@@ -246,13 +276,15 @@ def train_and_save(features_csv: str, n_splits: int = 10):
         "target": "DBP",
     }
 
-    joblib.dump(metadata_sbp, SBP_MODEL_PATH)
-    joblib.dump(metadata_dbp, DBP_MODEL_PATH)
-    logger.info("Model tersimpan: %s, %s", SBP_MODEL_PATH, DBP_MODEL_PATH)
+    joblib.dump(metadata_sbp, sbp_path)
+    joblib.dump(metadata_dbp, dbp_path)
+    logger.info("Model tersimpan: %s, %s", sbp_path, dbp_path)
 
     return {
         "y_sbp": y_sbp, "y_sbp_pred": y_sbp_pred_cv,
         "y_dbp": y_dbp, "y_dbp_pred": y_dbp_pred_cv,
+        "sbp_model_path": sbp_path, "dbp_model_path": dbp_path,
+        "report_path": report_path,
     }
 
 
@@ -260,9 +292,21 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Latih model EBT untuk SBP & DBP.")
     parser.add_argument("--features-csv", default=f"{PROCESSED_DATA_DIR}/features.csv")
     parser.add_argument("--n-splits", type=int, default=10)
+    parser.add_argument(
+        "--tag", default=None,
+        help=(
+            "Nama eksperimen (mis. --tag leaf8). Kalau diisi, model disimpan ke "
+            "models/ebt_{sbp,dbp}_<tag>.pkl dan laporan ke reports/eval_report_<tag>.csv "
+            "-- TIDAK menimpa models/ebt_sbp.pkl/ebt_dbp.pkl yang dipakai GUI. "
+            "Kosongkan untuk menimpa model produksi (perilaku lama)."
+        ),
+    )
     args = parser.parse_args()
 
-    results = train_and_save(args.features_csv, n_splits=args.n_splits)
+    try:
+        results = train_and_save(args.features_csv, n_splits=args.n_splits, model_tag=args.tag)
+    except ValueError as e:
+        parser.error(str(e))
 
-    print_and_save_report(results["y_sbp"], results["y_sbp_pred"], "SBP")
-    print_and_save_report(results["y_dbp"], results["y_dbp_pred"], "DBP")
+    print_and_save_report(results["y_sbp"], results["y_sbp_pred"], "SBP", out_path=results["report_path"])
+    print_and_save_report(results["y_dbp"], results["y_dbp_pred"], "DBP", out_path=results["report_path"])

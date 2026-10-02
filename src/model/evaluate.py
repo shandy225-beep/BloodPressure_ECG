@@ -73,8 +73,9 @@ def log_experiment(target_name: str, metrics: dict, run_info: dict, log_path: st
     file histori (urutkan kolom MAPE di Excel/pandas untuk cari yang terbaik).
 
     run_info wajib berisi key: timestamp, cv_mae, best_params, n_samples,
-    n_groups, n_splits, param_grid, features_csv (lihat pemanggilnya di
-    src/model/train.py::train_and_save).
+    n_groups, n_splits, param_grid, features_csv, model_tag, sbp_model_path,
+    dbp_model_path (lihat pemanggilnya di src/model/train.py::train_and_save).
+    model_tag kosong ("") berarti run itu MENIMPA model produksi (tanpa --tag).
 
     Gagal menulis (mis. file sedang dibuka di Excel di Windows -> file
     locked) HANYA dicatat sebagai warning, TIDAK melempar exception -- model
@@ -95,6 +96,9 @@ def log_experiment(target_name: str, metrics: dict, run_info: dict, log_path: st
         "n_splits": run_info["n_splits"],
         "param_grid": run_info["param_grid"],
         "features_csv": run_info["features_csv"],
+        "model_tag": run_info["model_tag"],
+        "sbp_model_path": run_info["sbp_model_path"],
+        "dbp_model_path": run_info["dbp_model_path"],
     }
     try:
         os.makedirs(os.path.dirname(log_path), exist_ok=True)

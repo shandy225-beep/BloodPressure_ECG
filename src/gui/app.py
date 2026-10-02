@@ -6,6 +6,7 @@ Aplikasi GUI real-time (PyQt5 + pyqtgraph): akuisisi ECG dari sensor Shimmer3R
 # Bagian 5.x proposal — Aplikasi real-time
 """
 
+import argparse
 import csv
 import logging
 import sys
@@ -25,7 +26,7 @@ from PyQt5.QtWidgets import (
 from src.config import (
     FS_TARGET, EPOCH_LEN, GUI_PLOT_WINDOW_SEC, GUI_UPDATE_INTERVAL_MS, GUI_DISPLAY_LAG_SEC,
     FILTER_CONTEXT_SEC, NOTCH_FREQ_HZ, BANDPASS_LOW_HZ, BANDPASS_HIGH_HZ,
-    SBP_MODEL_PATH, DBP_MODEL_PATH, FEATURE_NAMES,
+    SBP_MODEL_PATH, DBP_MODEL_PATH, FEATURE_NAMES, sanitize_tag, tagged_path,
 )
 from src.preprocessing.filters import apply_full_preprocessing
 from src.features.time_domain import extract_features
@@ -110,9 +111,19 @@ class AcquisitionWorker(QThread):
 
 
 class BPMonitorGUI(QMainWindow):
-    def __init__(self):
+    def __init__(self, model_tag: str = None):
         super().__init__()
-        self.setWindowTitle("BP-ECG Monitor — Estimasi Tekanan Darah dari Sinyal ECG (EBT)")
+        # model_tag: muat models/ebt_{sbp,dbp}_<tag>.pkl (hasil `train.py --tag <tag>`)
+        # alih-alih model produksi default -- untuk menguji model eksperimen di GUI
+        # TANPA menimpa/menyentuh models/ebt_sbp.pkl dan config.py sama sekali.
+        self.model_tag = sanitize_tag(model_tag) if model_tag else None
+        sbp_path = tagged_path(SBP_MODEL_PATH, self.model_tag) if self.model_tag else SBP_MODEL_PATH
+        dbp_path = tagged_path(DBP_MODEL_PATH, self.model_tag) if self.model_tag else DBP_MODEL_PATH
+
+        title = "BP-ECG Monitor — Estimasi Tekanan Darah dari Sinyal ECG (EBT)"
+        if self.model_tag:
+            title += f"  [EKSPERIMEN: {self.model_tag}]"
+        self.setWindowTitle(title)
         self.resize(1200, 700)
         self.setStyleSheet("""
             QWidget { background-color: #fafafa; font-family: Segoe UI; color: #222; }
@@ -125,7 +136,7 @@ class BPMonitorGUI(QMainWindow):
             QComboBox { padding: 4px; background-color: white; border: 1px solid #ccc; border-radius: 4px; }
         """)
 
-        self.predictor = Predictor()
+        self.predictor = Predictor(sbp_path=sbp_path, dbp_path=dbp_path)
         # Buffer ini yang memfilter (notch+bandpass) dengan konteks kiri/kanan,
         # supaya epoch setara dengan pipeline training (lihat FilteredEpochBuffer).
         self.epoch_buffer = FilteredEpochBuffer(epoch_len=EPOCH_LEN, fs=FS_TARGET)
@@ -246,7 +257,17 @@ class BPMonitorGUI(QMainWindow):
         model_frame = QFrame()
         model_frame.setStyleSheet("QFrame { background-color: #fff; border-radius: 12px; border: 1px solid #ddd; padding: 12px; }")
         model_layout = QVBoxLayout(model_frame)
-        model_status = "Model dimuat" if self.predictor.ok else "Model TIDAK ditemukan — jalankan src/model/train.py"
+        if self.predictor.ok:
+            model_status = (
+                f"Model EKSPERIMEN dimuat (--tag {self.model_tag})" if self.model_tag
+                else "Model produksi dimuat"
+            )
+        else:
+            model_status = (
+                f"Model eksperimen '{self.model_tag}' TIDAK ditemukan — jalankan "
+                f"src/model/train.py --tag {self.model_tag} terlebih dahulu" if self.model_tag
+                else "Model TIDAK ditemukan — jalankan src/model/train.py terlebih dahulu"
+            )
         model_color = "#1b5e20" if self.predictor.ok else "#b71c1c"
         self.model_status_label = QLabel(model_status)
         self.model_status_label.setStyleSheet(f"font-size: 10pt; color: {model_color};")
@@ -390,9 +411,23 @@ class BPMonitorGUI(QMainWindow):
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Aplikasi GUI real-time BP-ECG Monitor.")
+    parser.add_argument(
+        "--tag", default=None,
+        help=(
+            "Muat model EKSPERIMEN models/ebt_{sbp,dbp}_<tag>.pkl (hasil "
+            "`python -m src.model.train --tag <tag>`) alih-alih model produksi "
+            "default. Kosongkan untuk memuat model produksi seperti biasa."
+        ),
+    )
+    args = parser.parse_args()
+
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     app = QApplication(sys.argv)
-    win = BPMonitorGUI()
+    try:
+        win = BPMonitorGUI(model_tag=args.tag)
+    except ValueError as e:
+        parser.error(str(e))
     win.showMaximized()
     sys.exit(app.exec_())
 

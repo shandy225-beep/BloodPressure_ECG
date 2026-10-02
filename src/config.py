@@ -67,6 +67,34 @@ DBP_MODEL_PATH = os.path.join(MODELS_DIR, "ebt_dbp.pkl")
 
 FEATURE_REPORT_PATH = os.path.join(REPORTS_DIR, "eval_report.csv")
 
+# --tag eksperimen: dipakai bersama oleh src/model/train.py (simpan model/laporan
+# ke file terpisah, tidak menimpa produksi) dan src/gui/app.py (muat model
+# eksperimen tertentu untuk diuji, tanpa mengubah file ini). Logic-nya taruh di
+# sini, satu tempat, supaya kedua sisi (simpan & muat) selalu sepakat soal nama
+# file yang dihasilkan dari tag yang sama.
+_INVALID_TAG_CHARS = set('\\/:*?"<>|')
+
+
+def sanitize_tag(tag: str) -> str:
+    """Validasi --tag: spasi diganti '_' (kenyamanan), karakter path/terlarang
+    DITOLAK (supaya tidak sengaja menulis/membaca dari folder lain atau nama
+    file rusak)."""
+    tag = tag.strip().replace(" ", "_")
+    if not tag or any(c in _INVALID_TAG_CHARS for c in tag):
+        raise ValueError(
+            f"--tag tidak valid: {tag!r}. Hindari kosong dan karakter "
+            f"path/terlarang ({''.join(sorted(_INVALID_TAG_CHARS))})."
+        )
+    return tag
+
+
+def tagged_path(path: str, tag: str) -> str:
+    """Sisipkan tag sebelum ekstensi: models/ebt_sbp.pkl + tag "leaf8" ->
+    models/ebt_sbp_leaf8.pkl. tag HARUS sudah lolos sanitize_tag()."""
+    root, ext = os.path.splitext(path)
+    return f"{root}_{tag}{ext}"
+
+
 # Riwayat SEMUA eksperimen training (beda dengan FEATURE_REPORT_PATH di atas,
 # yang cuma menyimpan hasil model TERAKHIR): setiap kali train_and_save()
 # dipanggil, satu baris ditambahkan (append, tidak pernah ditimpa) lewat
