@@ -4,9 +4,10 @@ dari sinyal ABP menggunakan peakutils (konsisten dengan workflow lama).
 
 # Bagian 3.x proposal — Segmentasi epoch & anotasi target tekanan darah
 
-Fungsi segment_epochs() dipakai baik oleh training pipeline (data historis,
-non-overlapping) maupun real-time pipeline lewat kelas EpochBuffer (buffer
-1250 sampel dari stream yang sudah di-resample ke FS_TARGET).
+Training memakai segment_epochs()/build_epoch_dataset() pada rekaman yang sudah
+difilter utuh. Real-time memakai FilteredEpochBuffer (buffer sampel stream yang
+sudah di-resample ke FS_TARGET, difilter dengan konteks kiri/kanan) supaya epoch
+yang dihasilkan setara dengan training.
 """
 
 import logging
@@ -15,14 +16,15 @@ from typing import Iterator, Optional, Tuple
 import numpy as np
 import peakutils
 
-from src.config import FS_TARGET, EPOCH_LEN
+from src.config import FS_TARGET, EPOCH_LEN, FILTER_CONTEXT_LEN
+from src.preprocessing.filters import apply_full_preprocessing
 
 logger = logging.getLogger(__name__)
 
-# Non-overlapping dipilih sebagai default: dataset sekunder (part_1.mat, 1000
-# rekaman x ~60000 sampel) sudah cukup besar (~48 epoch/rekaman) sehingga
-# tidak perlu overlap untuk memperbanyak data latih. Overlap bisa diaktifkan
-# lewat parameter `hop_len` bila data latih di masa depan terbatas.
+# Non-overlapping dipilih sebagai default: dataset (12 part, ~12 ribu rekaman x
+# ~60000 sampel) sudah menghasilkan ~260 ribu epoch valid sehingga tidak perlu
+# overlap untuk memperbanyak data latih. Overlap bisa diaktifkan lewat parameter
+# `hop_len` bila data latih di masa depan terbatas.
 
 
 def segment_epochs(signal: np.ndarray, epoch_len: int = EPOCH_LEN, hop_len: Optional[int] = None) -> Iterator[np.ndarray]:
@@ -84,29 +86,62 @@ def build_epoch_dataset(ecg: np.ndarray, abp: np.ndarray, fs: int = FS_TARGET, e
         yield ecg_epoch, sbp, dbp
 
 
-class EpochBuffer:
-    """Buffer akumulasi sampel untuk mode real-time.
+class FilteredEpochBuffer:
+    """Buffer real-time yang menghasilkan epoch SUDAH TERFILTER dan setara
+    dengan pipeline training.
 
-    Dipakai oleh acquisition/shimmer_interface.py setelah sinyal di-resample
-    ke FS_TARGET: setiap sampel ditambahkan lewat add_sample(), begitu buffer
-    mencapai EPOCH_LEN sampel, add_sample() mengembalikan epoch penuh dan
-    mereset buffer (non-overlapping, sama seperti training).
+    Training memfilter seluruh rekaman lalu memotong epoch, sehingga tepi
+    epoch tidak terkena efek tepi filtfilt. Memfilter tiap epoch 10 dtk
+    secara terpisah menimbulkan efek tepi di kedua ujung epoch -> fitur
+    (mean, CV, median, ...) bergeser jauh dari distribusi training. Di sini
+    jendela yang difilter diperlebar `context_len` sampel di kiri & kanan
+    epoch, lalu hanya bagian tengahnya (epoch) yang diambil.
+
+    Konsekuensi: epoch k baru keluar setelah `context_len` sampel SETELAH
+    akhir epoch tsb diterima (tertunda context_len/fs detik). Epoch pertama
+    tidak punya konteks kiri -- identik dengan epoch pertama pada training
+    (awal rekaman juga tanpa konteks kiri). Sampel harus sudah di-resample
+    ke fs pipeline (FS_TARGET) sebelum masuk sini.
     """
 
-    def __init__(self, epoch_len: int = EPOCH_LEN):
+    def __init__(self, epoch_len: int = EPOCH_LEN, context_len: int = FILTER_CONTEXT_LEN, fs: int = FS_TARGET):
         self.epoch_len = epoch_len
-        self._buffer = []
-
-    def add_sample(self, value: float) -> Optional[np.ndarray]:
-        self._buffer.append(value)
-        if len(self._buffer) >= self.epoch_len:
-            epoch = np.array(self._buffer[: self.epoch_len])
-            self._buffer = self._buffer[self.epoch_len :]
-            return epoch
-        return None
+        self.context_len = context_len
+        self.fs = fs
+        self.reset()
 
     def reset(self):
-        self._buffer = []
+        self._buffer = []           # sampel mentah, mulai dari indeks global _buffer_start
+        self._buffer_start = 0
+        self._n_total = 0           # total sampel yang sudah diterima
+        self._next_epoch_start = 0  # indeks global awal epoch berikutnya
+
+    def add_sample(self, value: float) -> Optional[np.ndarray]:
+        """Tambah satu sampel mentah; kembalikan epoch terfilter bila sudah siap."""
+        self._buffer.append(value)
+        self._n_total += 1
+
+        epoch_start = self._next_epoch_start
+        epoch_end = epoch_start + self.epoch_len
+        window_end = epoch_end + self.context_len
+        if self._n_total < window_end:
+            return None
+
+        window_start = max(0, epoch_start - self.context_len)
+        offset = self._buffer_start
+        window = np.asarray(self._buffer[window_start - offset : window_end - offset], dtype=float)
+        filtered = apply_full_preprocessing(window, fs=self.fs)
+
+        left = epoch_start - window_start
+        epoch = filtered[left : left + self.epoch_len]
+
+        # Buang sampel yang tak diperlukan lagi: epoch berikutnya butuh
+        # context_len sampel sebelum awalnya (= akhir epoch ini).
+        self._next_epoch_start = epoch_end
+        keep_from = max(offset, epoch_end - self.context_len)
+        del self._buffer[: keep_from - offset]
+        self._buffer_start = keep_from
+        return epoch
 
     def __len__(self):
         return len(self._buffer)

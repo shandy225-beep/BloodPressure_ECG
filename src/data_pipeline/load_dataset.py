@@ -13,14 +13,12 @@ import os
 import numpy as np
 import scipy.io
 
-from src.config import DEFAULT_DATASET_FILE
-
 logger = logging.getLogger(__name__)
 
 PPG_ROW, ABP_ROW, ECG_ROW = 0, 1, 2
 
 
-def load_mat_records(path: str = DEFAULT_DATASET_FILE):
+def load_mat_records(path: str):
     """Generator yang menghasilkan (ecg, abp) per rekaman pasien dari file .mat.
 
     ecg, abp: np.ndarray 1D, native 125 Hz (FS_TARGET), tidak di-resample.
@@ -29,7 +27,7 @@ def load_mat_records(path: str = DEFAULT_DATASET_FILE):
         raise FileNotFoundError(
             f"Dataset tidak ditemukan di {path}. Unduh 'Cuff-Less Blood Pressure "
             f"Estimation' dari Kaggle (mkachuee/BloodPressureDataset), lalu taruh "
-            f"part_1.mat di folder Dataset/. Lihat README untuk instruksi lengkap."
+            f"part_1.mat ... part_12.mat di folder Dataset/. Lihat README untuk instruksi lengkap."
         )
 
     logger.info("Memuat dataset dari %s ...", path)

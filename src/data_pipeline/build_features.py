@@ -17,7 +17,7 @@ from typing import List, Union
 
 import pandas as pd
 
-from src.config import FS_TARGET, DEFAULT_DATASET_FILE, DATASET_GLOB_PATTERN, PROCESSED_DATA_DIR
+from src.config import FS_TARGET, DATASET_GLOB_PATTERN, PROCESSED_DATA_DIR
 from src.preprocessing.filters import apply_full_preprocessing
 from src.features.time_domain import extract_features
 from src.data_pipeline.load_dataset import load_mat_records
@@ -40,7 +40,7 @@ def discover_dataset_files(pattern: str = DATASET_GLOB_PATTERN) -> List[str]:
     return sorted(files, key=_part_number)
 
 
-def build_feature_dataframe(mat_paths: Union[str, List[str]] = DEFAULT_DATASET_FILE, max_records: int = None) -> pd.DataFrame:
+def build_feature_dataframe(mat_paths: Union[str, List[str]], max_records: int = None) -> pd.DataFrame:
     if isinstance(mat_paths, str):
         mat_paths = [mat_paths]
 

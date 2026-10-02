@@ -1,16 +1,15 @@
 """
 Aplikasi GUI real-time (PyQt5 + pyqtgraph): akuisisi ECG dari sensor Shimmer3R
--> resample ke FS_TARGET -> filter -> buffer epoch 1250 sampel -> ekstraksi
-25 fitur -> prediksi EBT (SBP/DBP) -> tampilkan.
+-> resample ke FS_TARGET -> buffer epoch 1250 sampel + filter berkonteks
+(FilteredEpochBuffer) -> ekstraksi 25 fitur -> prediksi EBT (SBP/DBP) -> tampilkan.
 
 # Bagian 5.x proposal — Aplikasi real-time
 """
 
+import argparse
 import csv
 import logging
-import os
 import sys
-import time
 from datetime import datetime
 
 import joblib
@@ -25,12 +24,13 @@ from PyQt5.QtWidgets import (
 )
 
 from src.config import (
-    FS_TARGET, EPOCH_LEN, GUI_PLOT_WINDOW_SEC, GUI_UPDATE_INTERVAL_MS,
-    SBP_MODEL_PATH, DBP_MODEL_PATH, FEATURE_NAMES,
+    FS_TARGET, EPOCH_LEN, GUI_PLOT_WINDOW_SEC, GUI_UPDATE_INTERVAL_MS, GUI_DISPLAY_LAG_SEC,
+    FILTER_CONTEXT_SEC, NOTCH_FREQ_HZ, BANDPASS_LOW_HZ, BANDPASS_HIGH_HZ,
+    SBP_MODEL_PATH, DBP_MODEL_PATH, FEATURE_NAMES, sanitize_tag, tagged_path,
 )
 from src.preprocessing.filters import apply_full_preprocessing
 from src.features.time_domain import extract_features
-from src.data_pipeline.epoching import EpochBuffer
+from src.data_pipeline.epoching import FilteredEpochBuffer
 from src.acquisition.shimmer_interface import ShimmerECGStream
 
 logger = logging.getLogger(__name__)
@@ -111,9 +111,19 @@ class AcquisitionWorker(QThread):
 
 
 class BPMonitorGUI(QMainWindow):
-    def __init__(self):
+    def __init__(self, model_tag: str = None):
         super().__init__()
-        self.setWindowTitle("BP-ECG Monitor — Estimasi Tekanan Darah dari Sinyal ECG (EBT)")
+        # model_tag: muat models/ebt_{sbp,dbp}_<tag>.pkl (hasil `train.py --tag <tag>`)
+        # alih-alih model produksi default -- untuk menguji model eksperimen di GUI
+        # TANPA menimpa/menyentuh models/ebt_sbp.pkl dan config.py sama sekali.
+        self.model_tag = sanitize_tag(model_tag) if model_tag else None
+        sbp_path = tagged_path(SBP_MODEL_PATH, self.model_tag) if self.model_tag else SBP_MODEL_PATH
+        dbp_path = tagged_path(DBP_MODEL_PATH, self.model_tag) if self.model_tag else DBP_MODEL_PATH
+
+        title = "BP-ECG Monitor — Estimasi Tekanan Darah dari Sinyal ECG (EBT)"
+        if self.model_tag:
+            title += f"  [EKSPERIMEN: {self.model_tag}]"
+        self.setWindowTitle(title)
         self.resize(1200, 700)
         self.setStyleSheet("""
             QWidget { background-color: #fafafa; font-family: Segoe UI; color: #222; }
@@ -126,14 +136,24 @@ class BPMonitorGUI(QMainWindow):
             QComboBox { padding: 4px; background-color: white; border: 1px solid #ccc; border-radius: 4px; }
         """)
 
-        self.predictor = Predictor()
-        self.epoch_buffer = EpochBuffer(epoch_len=EPOCH_LEN)
+        self.predictor = Predictor(sbp_path=sbp_path, dbp_path=dbp_path)
+        # Buffer ini yang memfilter (notch+bandpass) dengan konteks kiri/kanan,
+        # supaya epoch setara dengan pipeline training (lihat FilteredEpochBuffer).
+        self.epoch_buffer = FilteredEpochBuffer(epoch_len=EPOCH_LEN, fs=FS_TARGET)
         self.history = []  # list of (timestamp, sbp, dbp)
 
+        # Plot: buffer sampel MENTAH (hasil resample) + hitungan sampel total.
+        # Filtering dilakukan saat menggambar (lihat _update_plot) dengan
+        # apply_full_preprocessing yang sama dengan model. Waktu tiap sampel =
+        # nomor sampel / FS_TARGET (bukan time.time(): sampel tiba berkelompok
+        # dari resampler, sehingga jam dinding membuat kurva bergerigi).
         self.plot_buffer = []
-        self.plot_time_buffer = []
-        self.start_time = None
-        self.max_plot_samples = int(FS_TARGET * (GUI_PLOT_WINDOW_SEC + 5))
+        self.n_samples_total = 0
+        self.plot_dirty = False
+        self.display_lag = int(round(GUI_DISPLAY_LAG_SEC * FS_TARGET))
+        # cukup untuk: jendela tampil + ujung kanan yang ditahan + konteks kiri
+        # supaya efek tepi filter di ujung kiri buffer tidak terlihat.
+        self.max_plot_samples = int(FS_TARGET * (GUI_PLOT_WINDOW_SEC + GUI_DISPLAY_LAG_SEC + FILTER_CONTEXT_SEC))
 
         self.worker = None
 
@@ -159,10 +179,13 @@ class BPMonitorGUI(QMainWindow):
         # ----- Panel kiri: plot + kontrol -----
         left_panel = QVBoxLayout()
 
-        self.pg_plot = pg.PlotWidget(title="Sinyal ECG Real-time (setelah resample+filter)")
+        self.pg_plot = pg.PlotWidget(title=(
+            f"Sinyal ECG Real-time (resample {FS_TARGET} Hz, notch {NOTCH_FREQ_HZ:g} Hz + "
+            f"bandpass {BANDPASS_LOW_HZ:g}-{BANDPASS_HIGH_HZ:g} Hz; tampilan tertunda {GUI_DISPLAY_LAG_SEC:g} dtk)"
+        ))
         self.pg_plot.setBackground('w')
         self.pg_plot.showGrid(x=True, y=True, alpha=0.1)
-        self.pg_plot.setLabel('left', 'Amplitudo')
+        self.pg_plot.setLabel('left', 'Amplitudo (mV)')
         self.pg_plot.setLabel('bottom', 'Waktu (s)')
         self.ecg_curve = self.pg_plot.plot(pen=pg.mkPen(color='#1976D2', width=2))
         left_panel.addWidget(self.pg_plot, stretch=1)
@@ -234,7 +257,17 @@ class BPMonitorGUI(QMainWindow):
         model_frame = QFrame()
         model_frame.setStyleSheet("QFrame { background-color: #fff; border-radius: 12px; border: 1px solid #ddd; padding: 12px; }")
         model_layout = QVBoxLayout(model_frame)
-        model_status = "Model dimuat" if self.predictor.ok else "Model TIDAK ditemukan — jalankan src/model/train.py"
+        if self.predictor.ok:
+            model_status = (
+                f"Model EKSPERIMEN dimuat (--tag {self.model_tag})" if self.model_tag
+                else "Model produksi dimuat"
+            )
+        else:
+            model_status = (
+                f"Model eksperimen '{self.model_tag}' TIDAK ditemukan — jalankan "
+                f"src/model/train.py --tag {self.model_tag} terlebih dahulu" if self.model_tag
+                else "Model TIDAK ditemukan — jalankan src/model/train.py terlebih dahulu"
+            )
         model_color = "#1b5e20" if self.predictor.ok else "#b71c1c"
         self.model_status_label = QLabel(model_status)
         self.model_status_label.setStyleSheet(f"font-size: 10pt; color: {model_color};")
@@ -267,8 +300,9 @@ class BPMonitorGUI(QMainWindow):
             QMessageBox.critical(self, "Error", str(e))
             return
 
-        self.start_time = None
-        self.plot_buffer, self.plot_time_buffer = [], []
+        self.plot_buffer = []
+        self.n_samples_total = 0
+        self.plot_dirty = False
         self.epoch_buffer.reset()
         self.status_label.setText("Connecting...")
         self.status_label.setStyleSheet("font-size:13px; font-weight:bold; color:#f9a825;")
@@ -309,25 +343,20 @@ class BPMonitorGUI(QMainWindow):
         self._stop_measurement()
 
     def _on_new_sample(self, value: float):
-        now = time.time()
-        if self.start_time is None:
-            self.start_time = now
-        t = now - self.start_time
-
         self.plot_buffer.append(value)
-        self.plot_time_buffer.append(t)
+        self.n_samples_total += 1
+        self.plot_dirty = True
         if len(self.plot_buffer) > self.max_plot_samples:
             excess = len(self.plot_buffer) - self.max_plot_samples
             self.plot_buffer = self.plot_buffer[excess:]
-            self.plot_time_buffer = self.plot_time_buffer[excess:]
 
         completed_epoch = self.epoch_buffer.add_sample(value)
         if completed_epoch is not None:
             self._process_epoch(completed_epoch)
 
     def _process_epoch(self, epoch: np.ndarray):
-        filtered = apply_full_preprocessing(epoch, fs=FS_TARGET)
-        sbp, dbp = self.predictor.predict(filtered)
+        # epoch sudah terfilter oleh FilteredEpochBuffer -- JANGAN difilter lagi.
+        sbp, dbp = self.predictor.predict(epoch)
         if sbp is None:
             return
 
@@ -345,11 +374,19 @@ class BPMonitorGUI(QMainWindow):
 
     @pyqtSlot()
     def _update_plot(self):
-        if not self.plot_buffer:
+        # Belum ada sampel baru -> tak perlu filter ulang.
+        if not self.plot_dirty or len(self.plot_buffer) <= self.display_lag:
             return
-        data = np.array(self.plot_buffer)
-        tdata = np.array(self.plot_time_buffer)
-        self.ecg_curve.setData(tdata, data)
+        self.plot_dirty = False
+
+        raw = np.array(self.plot_buffer)
+        # Filter yang SAMA dengan yang dilihat model (zero-phase). Ujung kanan
+        # (display_lag sampel terakhir) dibuang karena masih kena efek tepi
+        # filtfilt; ujung kiri buffer sudah di luar jendela tampil.
+        filtered = apply_full_preprocessing(raw, fs=FS_TARGET)[: -self.display_lag]
+        first_index = self.n_samples_total - len(raw)
+        tdata = (first_index + np.arange(len(filtered))) / FS_TARGET
+        self.ecg_curve.setData(tdata, filtered)
 
         t_max = tdata[-1]
         t_min = max(0, t_max - GUI_PLOT_WINDOW_SEC)
@@ -374,9 +411,23 @@ class BPMonitorGUI(QMainWindow):
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Aplikasi GUI real-time BP-ECG Monitor.")
+    parser.add_argument(
+        "--tag", default=None,
+        help=(
+            "Muat model EKSPERIMEN models/ebt_{sbp,dbp}_<tag>.pkl (hasil "
+            "`python -m src.model.train --tag <tag>`) alih-alih model produksi "
+            "default. Kosongkan untuk memuat model produksi seperti biasa."
+        ),
+    )
+    args = parser.parse_args()
+
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     app = QApplication(sys.argv)
-    win = BPMonitorGUI()
+    try:
+        win = BPMonitorGUI(model_tag=args.tag)
+    except ValueError as e:
+        parser.error(str(e))
     win.showMaximized()
     sys.exit(app.exec_())
 
